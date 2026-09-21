@@ -7785,6 +7785,29 @@ impl Workspace {
         }
     }
 
+    fn matches_location(&self, location: &SerializedWorkspaceLocation, cx: &App) -> bool {
+        match (self.workspace_location(cx), location) {
+            (
+                WorkspaceLocation::Location(SerializedWorkspaceLocation::Local, _),
+                SerializedWorkspaceLocation::Local,
+            ) => true,
+            (
+                WorkspaceLocation::Location(SerializedWorkspaceLocation::Remote(left), _),
+                SerializedWorkspaceLocation::Remote(right),
+            ) => match (&left, right) {
+                (RemoteConnectionOptions::Wsl(left), RemoteConnectionOptions::Wsl(right)) => {
+                    // The WSL username is not consistently populated in the workspace location, so ignore it for now.
+                    left.distro_name == right.distro_name
+                }
+                (RemoteConnectionOptions::Docker(left), RemoteConnectionOptions::Docker(right)) => {
+                    left.container_id == right.container_id
+                }
+                _ => same_remote_connection_identity(Some(&left), Some(right)),
+            },
+            _ => false,
+        }
+    }
+
     fn workspace_location(&self, cx: &App) -> WorkspaceLocation {
         let paths = PathList::new(&self.root_paths(cx));
         if let Some(connection) = self.project.read(cx).remote_connection_options(cx) {
@@ -10813,43 +10836,11 @@ pub fn workspace_windows_for_location(
         .into_iter()
         .filter_map(|window| window.downcast::<MultiWorkspace>())
         .filter(|multi_workspace| {
-            let same_host = |left: &RemoteConnectionOptions, right: &RemoteConnectionOptions| match (left, right) {
-                (RemoteConnectionOptions::Ssh(a), RemoteConnectionOptions::Ssh(b)) => {
-                    (&a.host, &a.username, &a.port) == (&b.host, &b.username, &b.port)
-                }
-                (RemoteConnectionOptions::Wsl(a), RemoteConnectionOptions::Wsl(b)) => {
-                    // The WSL username is not consistently populated in the workspace location, so ignore it for now.
-                    a.distro_name == b.distro_name
-                }
-                (RemoteConnectionOptions::Docker(a), RemoteConnectionOptions::Docker(b)) => {
-                    a.container_id == b.container_id
-                }
-                #[cfg(any(test, feature = "test-support"))]
-                (RemoteConnectionOptions::Mock(a), RemoteConnectionOptions::Mock(b)) => {
-                    a.id == b.id
-                }
-                _ => false,
-            };
-
             multi_workspace.read(cx).is_ok_and(|multi_workspace| {
-                multi_workspace.workspaces().any(|workspace| {
-                    match workspace.read(cx).workspace_location(cx) {
-                        WorkspaceLocation::Location(location, _) => {
-                            match (&location, serialized_location) {
-                                (
-                                    SerializedWorkspaceLocation::Local,
-                                    SerializedWorkspaceLocation::Local,
-                                ) => true,
-                                (
-                                    SerializedWorkspaceLocation::Remote(a),
-                                    SerializedWorkspaceLocation::Remote(b),
-                                ) => same_host(a, b),
-                                _ => false,
-                            }
-                        }
-                        _ => false,
-                    }
-                })
+                !multi_workspace.is_remote_connection_placeholder
+                    && multi_workspace.workspaces().any(|workspace| {
+                        workspace.read(cx).matches_location(serialized_location, cx)
+                    })
             })
         })
         .collect()
@@ -10873,6 +10864,9 @@ pub async fn find_existing_workspace(
             for window in workspace_windows_for_location(location, cx) {
                 if let Ok(multi_workspace) = window.read(cx) {
                     for workspace in multi_workspace.workspaces() {
+                        if !workspace.read(cx).matches_location(location, cx) {
+                            continue;
+                        }
                         let project = workspace.read(cx).project.read(cx);
                         let m = match open_options.workspace_matching {
                             WorkspaceMatching::None => None,
@@ -10924,18 +10918,9 @@ pub async fn find_existing_workspace(
 
         if open_options.wait && existing.is_some() && all_paths_are_files {
             cx.update(|cx| {
-                let windows = workspace_windows_for_location(location, cx);
-                let window = cx
-                    .active_window()
-                    .and_then(|window| window.downcast::<MultiWorkspace>())
-                    .filter(|window| windows.contains(window))
-                    .or_else(|| windows.into_iter().next());
-                if let Some(window) = window {
-                    if let Ok(multi_workspace) = window.read(cx) {
-                        let active_workspace = multi_workspace.workspace().clone();
-                        existing = Some((window, active_workspace));
-                        open_visible = OpenVisible::None;
-                    }
+                if let Some(workspace) = preferred_workspace_for_location(location, cx) {
+                    existing = Some(workspace);
+                    open_visible = OpenVisible::None;
                 }
             });
         }
@@ -11160,21 +11145,12 @@ pub fn open_paths(
 
             if all_metadatas.into_iter().all(|file| !file.is_dir) {
                 cx.update(|cx| {
-                    let windows = workspace_windows_for_location(
+                    if let Some(workspace) = preferred_workspace_for_location(
                         &SerializedWorkspaceLocation::Local,
                         cx,
-                    );
-                    let window = cx
-                        .active_window()
-                        .and_then(|window| window.downcast::<MultiWorkspace>())
-                        .filter(|window| windows.contains(window))
-                        .or_else(|| windows.into_iter().next());
-                    if let Some(window) = window {
-                        if let Ok(multi_workspace) = window.read(cx) {
-                            let active_workspace = multi_workspace.workspace().clone();
-                            existing = Some((window, active_workspace));
-                            open_visible = OpenVisible::None;
-                        }
+                    ) {
+                        existing = Some(workspace);
+                        open_visible = OpenVisible::None;
                     }
                 });
             }
@@ -11588,7 +11564,6 @@ async fn open_remote_project_inner(
 
     let items = window
         .update(cx, |_, window, cx| {
-            window.activate_window();
             workspace.update(cx, |_workspace, cx| {
                 open_items(serialized_workspace, project_paths_to_open, window, cx)
             })
@@ -11611,6 +11586,23 @@ async fn open_remote_project_inner(
         workspace,
         items.into_iter().map(|item| item?.ok()).collect(),
     ))
+}
+
+fn preferred_workspace_for_location(
+    location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    let windows = workspace_windows_for_location(location, cx);
+    let window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>())
+        .filter(|window| windows.contains(window))
+        .or_else(|| windows.into_iter().next())?;
+    let multi_workspace = window.read(cx).ok()?;
+    let workspace = std::iter::once(multi_workspace.workspace())
+        .chain(multi_workspace.workspaces())
+        .find(|workspace| workspace.read(cx).matches_location(location, cx))?;
+    Some((window, workspace.clone()))
 }
 
 fn deserialize_remote_project(
