@@ -55,7 +55,7 @@ impl TextLayoutDetails {
             GridCell::measure(
                 &self.text_system,
                 &self.editor_style,
-                snapshot.highlight_styles(),
+                snapshot,
                 self.font_size(),
             )
         })

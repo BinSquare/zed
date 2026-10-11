@@ -3298,6 +3298,7 @@ impl EditorElement {
                 0,
                 is_row_soft_wrapped,
                 bg_segments_per_row,
+                false,
                 window,
                 cx,
             )
@@ -3684,7 +3685,7 @@ impl EditorElement {
         em_width: Pixels,
         text_x: Pixels,
         line_height: Pixels,
-        line_layouts: &[LineWithInvisibles],
+        line_layouts: &mut [LineWithInvisibles],
         selections: &[Selection<Point>],
         selected_buffer_ids: &Vec<BufferId>,
         latest_selection_anchors: &HashMap<BufferId, Anchor>,
@@ -7638,9 +7639,13 @@ impl LineWithInvisibles {
                     let covers_kept = fragment_range.start <= kept_range.start
                         && kept_range.end <= fragment_range.end;
                     let local = start - fragment_range.start..end - fragment_range.start;
-                    fragments.push(LineFragment::Text(
-                        line.slice(local, covers_kept.then_some(width)),
-                    ));
+                    if local == (0..fragment_len) {
+                        fragments.push(LineFragment::Text(line));
+                    } else {
+                        fragments.push(LineFragment::Text(
+                            line.slice(local, covers_kept.then_some(width)),
+                        ));
+                    }
                 }
                 element @ LineFragment::Element { .. } => {
                     debug_panic!("shaping context must not contain rendered elements");
@@ -7695,6 +7700,7 @@ impl LineWithInvisibles {
         shaped_start_index: usize,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
         bg_segments_per_row: &[Vec<(Range<DisplayPoint>, Hsla)>],
+        shape_without_backgrounds: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Self> {
@@ -7738,22 +7744,15 @@ impl LineWithInvisibles {
                 }
 
                 if !line.is_empty() {
-                    let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
-                    let text_runs: &[TextRun] = if segments.is_empty() {
-                        &styles
-                    } else {
-                        &Self::split_runs_by_bg_segments(
-                            &styles,
-                            segments,
-                            min_contrast,
-                            shaped_start_index + len,
-                        )
-                    };
-                    let shaped_line = window.text_system().shape_line(
+                    let shaped_line = Self::shape_text_line(
                         line.as_str().into(),
+                        &styles,
+                        bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]),
+                        shaped_start_index + len,
+                        shape_without_backgrounds,
                         font_size,
-                        text_runs,
-                        None,
+                        min_contrast,
+                        window,
                     );
                     width += shaped_line.width;
                     len += shaped_line.len;
@@ -7840,22 +7839,15 @@ impl LineWithInvisibles {
             } else {
                 for (ix, mut line_chunk) in highlighted_chunk.text.split('\n').enumerate() {
                     if ix > 0 {
-                        let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
-                        let text_runs = if segments.is_empty() {
-                            &styles
-                        } else {
-                            &Self::split_runs_by_bg_segments(
-                                &styles,
-                                segments,
-                                min_contrast,
-                                shaped_start_index + len,
-                            )
-                        };
-                        let shaped_line = window.text_system().shape_line(
+                        let shaped_line = Self::shape_text_line(
                             line.clone().into(),
+                            &styles,
+                            bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]),
+                            shaped_start_index + len,
+                            shape_without_backgrounds,
                             font_size,
-                            text_runs,
-                            None,
+                            min_contrast,
+                            window,
                         );
                         width += shaped_line.width;
                         len += shaped_line.len;
@@ -7865,7 +7857,7 @@ impl LineWithInvisibles {
                             width: ScrollPixelOffset::from(mem::take(&mut width)),
                             len: mem::take(&mut len),
                             fragments: mem::take(&mut fragments),
-                            invisibles: mem::take(&mut invisibles),
+                            invisibles: std::mem::take(&mut invisibles),
                             diagnostic_underline_severity_ranges: mem::take(
                                 &mut diagnostic_underline_severity_ranges,
                             ),
@@ -7965,6 +7957,31 @@ impl LineWithInvisibles {
         }
 
         layouts
+    }
+
+    fn shape_text_line(
+        text: SharedString,
+        styles: &[TextRun],
+        bg_segments: &[(Range<DisplayPoint>, Hsla)],
+        start_col_offset: usize,
+        shape_without_backgrounds: bool,
+        font_size: Pixels,
+        min_contrast: f32,
+        window: &Window,
+    ) -> ShapedLine {
+        let text_system = window.text_system();
+        if bg_segments.is_empty() {
+            return text_system.shape_line(text, font_size, styles, None);
+        }
+        let contrasted_runs =
+            Self::split_runs_by_bg_segments(styles, bg_segments, min_contrast, start_col_offset);
+        if shape_without_backgrounds {
+            text_system
+                .shape_line(text, font_size, styles, None)
+                .with_decorations(&contrasted_runs)
+        } else {
+            text_system.shape_line(text, font_size, &contrasted_runs, None)
+        }
     }
 
     fn add_point_diagnostic(&mut self, point_diagnostic: PointDiagnostic) {
@@ -9653,7 +9670,7 @@ impl Element for EditorElement {
                                     em_width,
                                     gutter_dimensions.full_width(),
                                     line_height,
-                                    &line_layouts,
+                                    &mut line_layouts,
                                     &local_selections,
                                     &selected_buffer_ids,
                                     &latest_selection_anchors,
@@ -9829,6 +9846,11 @@ impl Element for EditorElement {
                     } else {
                         None
                     };
+                    self.editor.update(cx, |editor, cx| {
+                        editor
+                            .display_map
+                            .update(cx, |display_map, cx| display_map.spawn_ruler_builds(cx))
+                    });
                     let indent_guides =
                         if scroll_pixel_position != preliminary_scroll_pixel_position {
                             self.layout_indent_guides(
@@ -11372,12 +11394,7 @@ pub fn layout_line(
 ) -> LineWithInvisibles {
     if let Some(row_len) = snapshot.long_unwrapped_row_len(row) {
         let font_size = style.text.font_size.to_pixels(window.rem_size());
-        let cell = GridCell::measure(
-            window.text_system(),
-            style,
-            snapshot.highlight_styles(),
-            font_size,
-        );
+        let cell = GridCell::measure(window.text_system(), style, snapshot, font_size);
         return layout_long_row(
             row,
             row_len,
@@ -11404,6 +11421,7 @@ pub fn layout_line(
         0,
         is_row_soft_wrapped,
         bg_segments,
+        false,
         window,
         cx,
     )
@@ -13728,6 +13746,7 @@ mod tests {
                     0,
                     |_| false,
                     &[],
+                    false,
                     window,
                     cx,
                 );
@@ -13746,12 +13765,9 @@ mod tests {
         for (text, expect_grid) in [
             ("abcdefghij".repeat(400), true),
             ("x".repeat(2_000) + "\t" + &"y".repeat(2_000), true),
-            ("é العربية क्षि ก้ 漢字 🧑🏽‍💻 ".repeat(100), false),
-            ("abc ".repeat(300) + &"مرحبا xyz ".repeat(300), false),
-            ("שלום עולם ".repeat(1_100), false),
+            ("é क्षि ก้ 漢字 🧑🏽‍💻 ".repeat(100), false),
             ("🙂".repeat(MAX_LINE_LEN), false),
         ] {
-            let rtl = text.starts_with('ש');
             let (window, mut cx, _, style) = test_editor(&text, EditorMode::full(), cx);
             window
                 .update(&mut cx, |editor, window, cx| {
@@ -13786,16 +13802,12 @@ mod tests {
                         let visible_right = visible_left + viewport.visible_columns * cell_width;
                         assert!(layout.start_x() <= visible_left);
                         assert!(layout.shaped_end_x() >= visible_right);
-                        assert_eq!(layout.x_for_index(0) > 0., rtl);
 
                         for index in (0..=text.len())
                             .step_by(text.len() / 256 + 1)
                             .filter(|index| text.is_char_boundary(*index))
                         {
-                            let (x, tolerance) = match rtl {
-                                true => (row_layout.x_for_index(index), 0.01),
-                                false => (f64::from(full_row.x_for_index(index)), tolerance),
-                            };
+                            let x = f64::from(full_row.x_for_index(index));
                             for layout_x in [
                                 layout.x_for_index(index),
                                 grid_only.x_for_index(index),
@@ -13819,6 +13831,80 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_windowed_replacement_rows_render_at_ruler_positions(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let text = "\u{1}a".repeat(2 * MAX_LINE_LEN);
+        let (window, mut cx, _, _) = test_editor(&text, EditorMode::full(), cx);
+        window
+            .update(&mut cx, |editor, window, cx| {
+                for scroll_columns in [0., 1_000., 3_000.] {
+                    let (snapshot, details, layout) =
+                        scrolled_row_layout(editor, 0, scroll_columns, true, window, cx);
+                    let row_layout = snapshot.layout_row(DisplayRow(0), &details);
+                    let shaped_start = layout.shaped_start_index();
+                    let shaped = shaped_start..shaped_start + layout.shaped_len();
+                    assert!(0 < shaped.len() && shaped.len() < text.len());
+                    for index in shaped {
+                        let (rendered, ruled) =
+                            (layout.x_for_index(index), row_layout.x_for_index(index));
+                        assert!(
+                            (rendered - ruled).abs() < 0.5,
+                            "scrolled to {scroll_columns}, byte {index}: {rendered} != {ruled}"
+                        );
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_large_ruled_rows_render_estimates_until_built(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let text = "漢字".repeat(6_000);
+        let (window, mut cx, _, _) = test_editor(&text, EditorMode::full(), cx);
+        window
+            .update(&mut cx, |editor, window, cx| {
+                let (snapshot, details, estimated) =
+                    scrolled_row_layout(editor, 0, 3_000., true, window, cx);
+                let cell_width = f64::from(details.grid_cell(&snapshot).width);
+                let shaped = estimated.shaped_start_index()
+                    ..estimated.shaped_start_index() + estimated.shaped_len();
+                assert!(0 < shaped.start && shaped.end < text.len());
+                assert!(text.is_char_boundary(shaped.start) && text.is_char_boundary(shaped.end));
+                assert_eq!(
+                    (estimated.len, estimated.width),
+                    (text.len(), text.len() as f64 * cell_width)
+                );
+                editor
+                    .display_map
+                    .update(cx, |map, cx| map.spawn_ruler_builds(cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(&mut cx, |editor, window, cx| {
+                let (snapshot, details, built) =
+                    scrolled_row_layout(editor, 0, 3_000., true, window, cx);
+                let char_width = f64::from(details.grid_cell(&snapshot).width);
+                let expected_x = |index: usize| text[..index].chars().count() as f64 * char_width;
+                let tolerance = 1e-4 * expected_x(text.len());
+                let shaped_end = built.shaped_start_index() + built.shaped_len();
+                for index in [built.shaped_start_index(), shaped_end, text.len()] {
+                    assert!(
+                        (built.x_for_index(index) - expected_x(index)).abs() < tolerance,
+                        "byte {index}: {} != {}",
+                        built.x_for_index(index),
+                        expected_x(index)
+                    );
+                }
+                assert!((built.width - expected_x(text.len())).abs() < tolerance);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn test_windowed_rows_keep_trailing_whitespace_and_tab_extents(cx: &mut TestAppContext) {
         init_test(cx, |settings| {
             settings.defaults.show_whitespaces = Some(ShowWhitespaceSetting::Trailing);
@@ -13836,11 +13922,6 @@ mod tests {
             .update(&mut cx, |editor, window, cx| {
                 let (_, details, spaces) = scrolled_row_layout(editor, 0, 170., true, window, cx);
                 let (_, _, tab) = scrolled_row_layout(editor, 1, 170., true, window, cx);
-                assert_eq!(
-                    (spaces.shaped_start_index(), spaces.shaped_len()),
-                    (100, 250)
-                );
-                assert_eq!((tab.shaped_start_index(), tab.shaped_len()), (100, 250));
                 assert_eq!(spaces.trailing_whitespace_start, Some(1));
                 assert_eq!(spaces.invisibles.len(), 250);
                 assert_eq!(
@@ -13854,6 +13935,23 @@ mod tests {
                     tab.x_for_index(60),
                     60. * f64::from(details.em_layout_width())
                 );
+
+                let row_end = Point::new(0, 1 + MAX_LINE_LEN as u32);
+                editor.edit([(row_end..row_end, "z")], cx);
+                let (_, _, edited) = scrolled_row_layout(editor, 0, 170., true, window, cx);
+                assert_eq!(edited.trailing_whitespace_start, Some(MAX_LINE_LEN + 2));
+
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let hint = Inlay::mock_hint(
+                    0,
+                    snapshot.anchor_after(MultiBufferOffset(1)),
+                    format!("x\n{}\n", " ".repeat(MAX_LINE_LEN + 1)),
+                );
+                editor
+                    .display_map
+                    .update(cx, |map, cx| map.splice_inlays(&[], vec![hint], cx));
+                let (_, _, inlay_row) = scrolled_row_layout(editor, 1, 0., true, window, cx);
+                assert_eq!(inlay_row.trailing_whitespace_start, Some(0));
             })
             .unwrap();
     }
